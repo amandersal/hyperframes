@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { WhisperUnavailableError } from "../whisper/manager.js";
+import { formatVtt, loadTranscript } from "../whisper/normalize.js";
 import { CliRuntimeError, consumeCommandResult } from "../utils/commandResult.js";
 
 // Make the whisper core report "unavailable" so we exercise the soft-skip path.
@@ -585,6 +586,10 @@ echo '{"sentences":[{"tokens":[{"text":" hola","start":0,"end":1}]}]}' > "$2/$(b
       dirs.push(dir);
       await transcribeCmd.run!({ args: { input, json: true, engine: "auto" } } as never);
       expect(lastJson()).toMatchObject({ ok: true, engine: "parakeet", wordCount: 0 });
+
+      await transcribeCmd.run!({ args: { input, json: true, engine: "auto", to: "srt" } } as never);
+      expect(lastJson()).toMatchObject({ ok: true, wordCount: 0, format: "srt" });
+      expect(readFileSync(join(dir, "transcript.srt"), "utf-8")).toBe("");
     });
 
     it.runIf(process.platform === "linux" && process.arch === "x64")(
@@ -637,6 +642,97 @@ Render video. Built for agents.
       wordCount: 2,
       outputPath,
     });
+  });
+
+  it("transcribes a media file straight to a VTT sidecar in one run", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const words = [
+      { id: "w0", text: "Write", start: 0, end: 0.5 },
+      { id: "w1", text: "HTML.", start: 0.5, end: 1 },
+    ];
+    transcribeMock.mockImplementation(async (_input, outputDir) => {
+      const result = fakeTranscript(outputDir, "whisper");
+      writeFileSync(result.transcriptPath, JSON.stringify(words));
+      return { ...result, wordCount: 2 };
+    });
+
+    await runCommand(transcribeCmd, {
+      rawArgs: [input, "--dir", dir, "--engine", "whisper", "--to", "vtt", "--json"],
+    });
+
+    const outputPath = join(dir, "transcript.vtt");
+    expect(readFileSync(outputPath, "utf-8")).toBe(formatVtt(words));
+    expect(JSON.parse(readFileSync(join(dir, "transcript.json"), "utf8"))).toEqual(words);
+    expect(console.log).toHaveBeenCalledTimes(1);
+    expect(lastJson()).toMatchObject({ ok: true, wordCount: 2, format: "vtt", outputPath });
+  });
+
+  it("fails on a missing --output folder before transcribing", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const output = join(dir, "missing", "captions.srt");
+
+    await expect(
+      transcribeCmd.run!({
+        args: { input, json: true, engine: "whisper", to: "srt", output },
+      } as never),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(transcribeMock).not.toHaveBeenCalled();
+    expect(lastJson()).toEqual({
+      ok: false,
+      error: `Output folder not found: ${join(dir, "missing")}`,
+    });
+  });
+
+  it.each([
+    ["an existing folder", (dir: string) => dir, "--output is a folder"],
+    [
+      "a path ending in a slash",
+      (dir: string) => join(dir, "captions") + "/",
+      "--output is a folder",
+    ],
+    [
+      "a path under a file",
+      (dir: string) => join(dir, "narration.wav", "out.srt"),
+      "Output folder not found",
+    ],
+  ])("fails --output naming %s before transcribing", async (_name, output, error) => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+
+    await expect(
+      transcribeCmd.run!({
+        args: { input, json: true, engine: "whisper", to: "srt", output: output(dir) },
+      } as never),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(transcribeMock).not.toHaveBeenCalled();
+    expect(lastJson()).toMatchObject({ ok: false, error: expect.stringContaining(error) });
+  });
+
+  it("groups transcribed CJK words into captions instead of one cue per word", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    transcribeMock.mockImplementation(async (_input, outputDir) => {
+      const result = fakeTranscript(outputDir, "whisper");
+      writeFileSync(
+        result.transcriptPath,
+        JSON.stringify([
+          { text: "今日はいい", start: 0, end: 0.8 },
+          { text: "天気ですね", start: 0.8, end: 1.6 },
+        ]),
+      );
+      return { ...result, wordCount: 2 };
+    });
+
+    await transcribeCmd.run!({
+      args: { input, dir, json: true, engine: "whisper", to: "srt" },
+    } as never);
+
+    const { words: cues } = loadTranscript(join(dir, "transcript.srt"));
+    expect(cues.map((cue) => cue.text)).toEqual(["今日はいい天気ですね"]);
   });
 
   it("rejects a below-minimum --timeout with a discoverable error", async () => {

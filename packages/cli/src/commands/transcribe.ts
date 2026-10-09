@@ -4,7 +4,7 @@ import { normalizeErrorMessage } from "../utils/errorMessage.js";
 // fallow-ignore-file code-duplication
 import { defineCommand } from "citty";
 import type { Example } from "./_examples.js";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, statSync, writeFileSync } from "node:fs";
 import {
   PARAKEET_INSTALL_COMMAND,
   PARAKEET_LANGUAGES,
@@ -13,6 +13,7 @@ import {
 } from "../whisper/parakeet.js";
 
 type CaptionExportFormat = "srt" | "vtt";
+type CaptionSidecar = { to: CaptionExportFormat; output?: string; preserveCues: boolean };
 
 export const examples: Example[] = [
   ["Transcribe an audio file", "hyperframes transcribe audio.mp3"],
@@ -22,6 +23,7 @@ export const examples: Example[] = [
   ["Import an existing SRT file", "hyperframes transcribe subtitles.srt"],
   ["Import an OpenAI Whisper JSON response", "hyperframes transcribe response.json"],
   ["Export captions to SRT", "hyperframes transcribe transcript.json --to srt"],
+  ["Transcribe a video straight to VTT captions", "hyperframes transcribe video.mp4 --to vtt"],
   [
     "Export single-word/CJK captions without re-grouping",
     "hyperframes transcribe transcript.json --to vtt --preserve-cues",
@@ -31,6 +33,7 @@ import { resolve, join, extname, dirname } from "node:path";
 import * as clack from "@clack/prompts";
 import { c } from "../ui/colors.js";
 import { DEFAULT_MODEL, isWhisperUnavailable } from "../whisper/manager.js";
+import type { Word } from "../whisper/normalize.js";
 import type { ParakeetRunner } from "../whisper/parakeetRunner.js";
 
 // Minimum accepted value for `--timeout` / `HYPERFRAMES_TRANSCRIBE_TIMEOUT_MS`.
@@ -84,7 +87,8 @@ export default defineCommand({
     },
     to: {
       type: "string",
-      description: "Export transcript sidecar format: srt or vtt",
+      description:
+        "Write an srt or vtt caption sidecar: exported from a transcript file, or written after transcribing audio/video",
     },
     output: {
       type: "string",
@@ -136,16 +140,10 @@ export default defineCommand({
 
     // ── Import mode: convert existing transcript ──────────────────────────
     const isImport = ext === ".json" || ext === ".srt" || ext === ".vtt";
-    const to = parseExportFormat(args.to, args.json);
+    const sidecar = parseSidecar(args);
 
-    if (to) {
-      if (!isImport) {
-        failWith(
-          "--to can only export from transcript files (.json, .srt, .vtt). Run transcribe first.",
-          args.json,
-        );
-      }
-      return exportTranscript(inputPath, dir, to, args.output, args.json, args["preserve-cues"]);
+    if (sidecar && isImport) {
+      return exportTranscript(inputPath, dir, sidecar, args.json);
     }
 
     if (isImport) {
@@ -163,6 +161,7 @@ export default defineCommand({
       optional: args.optional,
       installRuntime: args["runtime-install"],
       timeoutMs,
+      sidecar,
     });
   },
 });
@@ -210,6 +209,30 @@ function parseExportFormat(
   failWith(`Unsupported caption export format: ${value}. Use srt or vtt.`, json);
 }
 
+function parseSidecar(args: {
+  to?: string;
+  output?: string;
+  "preserve-cues": boolean;
+  json: boolean;
+}): CaptionSidecar | undefined {
+  const to = parseExportFormat(args.to, args.json);
+  if (!to) return undefined;
+  if (args.output) {
+    const outPath = resolve(args.output);
+    const folder = dirname(outPath);
+    if (!existsSync(folder) || !statSync(folder).isDirectory()) {
+      failWith(`Output folder not found: ${folder}`, args.json);
+    }
+    if (/[\\/]$/.test(args.output) || (existsSync(outPath) && statSync(outPath).isDirectory())) {
+      failWith(
+        `--output is a folder; give a file path such as ${join(outPath, `transcript.${to}`)}`,
+        args.json,
+      );
+    }
+  }
+  return { to, output: args.output, preserveCues: args["preserve-cues"] };
+}
+
 // ---------------------------------------------------------------------------
 // Import existing transcript
 // ---------------------------------------------------------------------------
@@ -243,37 +266,60 @@ async function importTranscript(inputPath: string, dir: string, json: boolean): 
 // Export transcript sidecars
 // ---------------------------------------------------------------------------
 
-async function exportTranscript(
-  inputPath: string,
+async function writeCaptionSidecar(
+  words: Word[],
   dir: string,
-  to: CaptionExportFormat,
-  output: string | undefined,
-  json: boolean,
-  preserveCues: boolean,
-): Promise<void> {
-  const { loadTranscript, formatSrt, formatVtt } = await import("../whisper/normalize.js");
-  const { words, format } = loadTranscript(inputPath);
-
-  if (words.length === 0) exitNoWords(json);
-
+  { to, output, preserveCues }: CaptionSidecar,
+  phraseLevelSource: boolean | undefined,
+): Promise<string> {
+  const { formatSrt, formatVtt } = await import("../whisper/normalize.js");
   // A .srt/.vtt source is already phrase-level; keep its cue boundaries 1:1.
   // --preserve-cues forces the same for an already-cued transcript.json whose
   // entries have no internal whitespace (single-word or CJK captions), which
   // the automatic whitespace heuristic in wordsToCues can't detect.
-  const preGrouped = preserveCues || format === "srt" || format === "vtt" || undefined;
+  const preGrouped = preserveCues || phraseLevelSource;
   const outPath = resolve(output ?? join(dir, `transcript.${to}`));
   const content =
     to === "srt" ? formatSrt(words, { preGrouped }) : formatVtt(words, { preGrouped });
   writeFileSync(outPath, content);
+  return outPath;
+}
+
+function reportSidecar(to: CaptionExportFormat, wordCount: number, outPath: string): void {
+  console.log(
+    `${c.success("◇")}  Exported ${c.accent(String(wordCount))} words to ${c.accent(to.toUpperCase())} → ${c.accent(outPath)}`,
+  );
+}
+
+async function exportTranscript(
+  inputPath: string,
+  dir: string,
+  sidecar: CaptionSidecar,
+  json: boolean,
+): Promise<void> {
+  const { loadTranscript } = await import("../whisper/normalize.js");
+  const { words, format } = loadTranscript(inputPath);
+
+  if (words.length === 0) exitNoWords(json);
+
+  const outPath = await writeCaptionSidecar(
+    words,
+    dir,
+    sidecar,
+    format === "srt" || format === "vtt" || undefined,
+  );
 
   if (json) {
     console.log(
-      JSON.stringify({ ok: true, format: to, wordCount: words.length, outputPath: outPath }),
+      JSON.stringify({
+        ok: true,
+        format: sidecar.to,
+        wordCount: words.length,
+        outputPath: outPath,
+      }),
     );
   } else {
-    console.log(
-      `${c.success("◇")}  Exported ${c.accent(String(words.length))} words to ${c.accent(to.toUpperCase())} → ${c.accent(outPath)}`,
-    );
+    reportSidecar(sidecar.to, words.length, outPath);
   }
 }
 
@@ -308,6 +354,7 @@ async function transcribeAudio(
     optional?: boolean;
     installRuntime?: boolean;
     timeoutMs?: number;
+    sidecar?: CaptionSidecar;
   },
 ): Promise<void> {
   const { transcribe } = await import("../whisper/transcribe.js");
@@ -415,6 +462,10 @@ async function transcribeAudio(
 
     writeFileSync(result.transcriptPath, JSON.stringify(words, null, 2));
     patchCaptionHtml(dir, words);
+    const exported = opts.sidecar && {
+      format: opts.sidecar.to,
+      outputPath: await writeCaptionSidecar(words, dir, opts.sidecar, false),
+    };
 
     if (opts.json) {
       console.log(
@@ -427,6 +478,7 @@ async function transcribeAudio(
           durationSeconds: result.durationSeconds,
           speechOnsetSeconds: result.speechOnsetSeconds,
           transcriptPath: result.transcriptPath,
+          ...exported,
         }),
       );
     } else {
@@ -439,6 +491,7 @@ async function transcribeAudio(
           `Transcribed ${c.accent(String(words.length))} words (${result.durationSeconds.toFixed(1)}s${onsetNote})`,
         ),
       );
+      if (exported) reportSidecar(exported.format, words.length, exported.outputPath);
     }
   } catch (err) {
     if (err instanceof DecodeCancelled || cancellation?.signal.aborted) {
