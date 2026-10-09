@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeAll } from "vitest";
+import { nestedCompositionPathFixture } from "../compiler/nestedCompositionPath.testFixture";
 import { loadCompositions } from "./compositionLoader";
+import { applyVariableBindings } from "./applyVariableBindings";
 
 type LoaderParams = Parameters<typeof loadCompositions>[0];
 
@@ -46,14 +48,193 @@ beforeAll(() => {
 });
 
 describe("loadCompositions external hosts", () => {
+  it("loads external children in one pass without fetching their parent again", async () => {
+    const base = document.createElement("base");
+    base.href = "https://example.com/";
+    document.head.appendChild(base);
+    const host = appendExternalHost("https://example.com/scenes/outer.html", "outer");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const html = String(input).endsWith("outer.html")
+        ? '<html><body><div data-composition-id="outer"><div data-composition-id="inner" data-composition-src="scenes/inner.html"></div></div></body></html>'
+        : '<html><body><div data-composition-id="inner"><p>Inner content</p></div></body></html>';
+      return new Response(html, { status: 200 });
+    });
+    await loadFixture();
+    expect(host.querySelector("p")?.textContent).toBe("Inner content");
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "https://example.com/scenes/outer.html",
+      "https://example.com/scenes/inner.html",
+    ]);
+  });
+
+  it("matches bundled root-relative child paths from a nested composition directory", async () => {
+    const files = nestedCompositionPathFixture;
+    const base = document.createElement("base");
+    base.href = "https://example.com/project/";
+    document.head.appendChild(base);
+    document.body.innerHTML = files["index.html"]!;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const relative = new URL(String(input)).pathname.slice("/project/".length);
+      const content = files[relative];
+      return new Response(content ?? "Not found", { status: content === undefined ? 404 : 200 });
+    });
+    const onDiagnostic = vi.fn();
+    await loadFixture({ onDiagnostic });
+    expect(document.querySelector("[data-proof]")?.textContent).toBe("Project-root card");
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "https://example.com/project/compositions/scene.html",
+      "https://example.com/project/compositions/cards/card.html",
+    ]);
+    expect(onDiagnostic).not.toHaveBeenCalled();
+  });
+
+  it("loads external children introduced by a template mount", async () => {
+    document.body.innerHTML = `<template id="outer-template"><div data-composition-id="outer"><div data-composition-id="inner" data-composition-src="https://example.com/inner.html"></div></div></template><div data-composition-id="outer"></div>`;
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(
+        async () =>
+          new Response(
+            '<html><body><div data-composition-id="inner"><p>Template child</p></div></body></html>',
+            { status: 200 },
+          ),
+      );
+    await loadFixture();
+    expect(document.querySelector("[data-composition-src] p")?.textContent).toBe("Template child");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds concurrent external loads while mounting every host", async () => {
+    for (let i = 0; i < 8; i++)
+      appendExternalHost(`https://example.com/card-${i}.html`, `card-${i}`);
+    let active = 0;
+    let peak = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      active--;
+      return new Response("<html><body><p>Loaded</p></body></html>", { status: 200 });
+    });
+    await loadFixture();
+    expect(peak).toBeLessThanOrEqual(4);
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+    expect(document.querySelectorAll("[data-composition-src] p")).toHaveLength(8);
+  });
+
+  it("starts a queued load as soon as any earlier load finishes", async () => {
+    for (let i = 0; i < 5; i++)
+      appendExternalHost(`https://example.com/pool-${i}.html`, `pool-${i}`);
+    let releaseSlow = () => {};
+    const slow = new Promise<void>((resolve) => (releaseSlow = resolve));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input).endsWith("pool-0.html")) await slow;
+      if (String(input).endsWith("pool-4.html")) releaseSlow();
+      return new Response("<html><body><p>Loaded</p></body></html>", { status: 200 });
+    });
+    await loadFixture();
+    expect(document.querySelectorAll("[data-composition-src] p")).toHaveLength(5);
+  });
+
+  it("adds stylesheets in document order even when an earlier host's fetch finishes last", async () => {
+    appendExternalHost("https://example.com/order-a.html", "order-a");
+    appendExternalHost("https://example.com/order-b.html", "order-b");
+    const page = (name: string) =>
+      new Response(
+        `<html><head><link rel="stylesheet" href="./${name}.css"></head><body><p>${name}</p></body></html>`,
+        { status: 200 },
+      );
+    vi.useFakeTimers();
+    try {
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+        if (!String(input).endsWith("order-a.html")) return page("order-b");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return page("order-a");
+      });
+      const loading = loadFixture();
+      await vi.runAllTimersAsync();
+      await loading;
+    } finally {
+      vi.useRealTimers();
+    }
+    const hrefs = Array.from(document.head.querySelectorAll('link[href*="order-"]'), (link) =>
+      link.getAttribute("href"),
+    );
+    expect(hrefs).toEqual(["https://example.com/order-a.css", "https://example.com/order-b.css"]);
+  });
+
+  it("refuses a circular nested external reference without fetching it again", async () => {
+    const base = document.createElement("base");
+    base.href = "https://example.com/";
+    document.head.appendChild(base);
+    const host = appendExternalHost("https://example.com/loop.html", "loop");
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(
+        async () =>
+          new Response(
+            '<html><body><div data-composition-id="loop"><div data-composition-id="child" data-composition-src="./loop.html"></div></div></body></html>',
+            { status: 200 },
+          ),
+      );
+    const onDiagnostic = vi.fn();
+    await loadFixture({ onDiagnostic });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        details: expect.objectContaining({ errorMessage: "circular composition reference" }),
+      }),
+    );
+    expect(host.querySelector('[data-composition-id="child"]')?.children).toHaveLength(0);
+  });
+
+  it("binds a loaded authored root to its host despite a sibling id collision", async () => {
+    const first = appendExternalHost("https://example.com/card.html", "host");
+    first.setAttribute("data-variable-values", '{"title":"First"}');
+    const second = appendExternalHost("https://example.com/card.html", "card");
+    second.setAttribute("data-variable-values", '{"title":"Second"}');
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () =>
+        new Response(
+          '<html><body><div data-composition-id="card"><p data-var-text="title">Default</p></div></body></html>',
+          { status: 200 },
+        ),
+    );
+    await loadFixture();
+    applyVariableBindings(document);
+    expect(first.querySelector("p")?.textContent).toBe("First");
+    expect(second.querySelector("p")?.textContent).toBe("Second");
+  });
+
+  it("keeps an empty nested mount on top-level variables after loading", async () => {
+    const host = appendExternalHost("https://example.com/outer.html", "outer");
+    host.setAttribute("data-variable-values", '{"title":"Outer"}');
+    window.__hfVariables = { title: "Top" };
+    const template = document.createElement("template");
+    template.id = "inner-template";
+    template.innerHTML =
+      '<div data-composition-id="inner"><p data-var-text="title">Default</p></div>';
+    document.body.appendChild(template);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('<html><body><div data-composition-id="inner"></div></body></html>', {
+        status: 200,
+      }),
+    );
+    await loadFixture();
+    applyVariableBindings(document);
+    expect(host.querySelector("p")?.textContent).toBe("Top");
+    delete window.__hfVariables;
+  });
+
   afterEach(() => {
     document.body.innerHTML = "";
-    document.head.querySelectorAll("style, link").forEach((node) => node.remove());
+    document.head.querySelectorAll("style, link, base").forEach((node) => node.remove());
     delete (window as Window & { gsap?: unknown; __selectedTitle?: unknown }).gsap;
     delete (window as Window & { gsap?: unknown; __selectedTitle?: unknown }).__selectedTitle;
     delete (window as Window & { __hyperframes?: unknown }).__hyperframes;
     delete (window as Window & { __timelines?: unknown }).__timelines;
     delete (window as WindowWithScopedVars).__hfVariablesByComp;
+    delete window.__hfVariables;
     delete (document as { fonts?: unknown }).fonts;
     vi.restoreAllMocks();
   });
