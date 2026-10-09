@@ -6,17 +6,17 @@ import {
   headStyleRuns,
   INLINED_FILE_ATTR,
   inlineScriptRuns,
-  isJavaScriptType,
   styleElementsFor,
   type CompositionStyle,
 } from "./scriptRuns";
+import { executableScripts, isJavaScriptType } from "./compositionAssembly";
 import { SCENE_PART_ATTR } from "../sceneParts";
 import {
   ensureExternalScriptTag,
   readExternalScriptAttributes,
   type ExternalScriptAttributes,
 } from "./externalScripts";
-import { emitMountedModuleScripts } from "./importMaps";
+import { emitMountedModuleScripts, parseImportMap, type ImportMap } from "./importMaps";
 import { markFlattenedInnerRoot } from "../runtime/flattenedRoot";
 export { FLATTENED_INNER_ROOT_STRIP_ATTRS } from "../runtime/flattenedRoot";
 import { parseHostVariableValues, warnUnknownEnumValues } from "../runtime/getVariables";
@@ -48,6 +48,7 @@ import {
   dedupeFontFaceRules,
   scopeCssToComposition,
   wrapInlineScriptWithErrorBoundary,
+  scopedModulePrelude,
   wrapScopedCompositionScript,
 } from "./compositionScoping";
 import { validateHyperframeHtmlContract } from "./staticGuard";
@@ -744,10 +745,14 @@ function coalesceHeadStylesAndBodyScripts(document: Document): void {
     isPinned,
   )) {
     const mergedJs = joinJsChunks(members.map((el) => el.textContent || ""));
+    if (mergedJs && !parsesAsScript(mergedJs)) {
+      for (const el of members) el.textContent = inlineScriptSource(el.textContent || "");
+      continue;
+    }
     for (const el of members) el.remove();
     if (!mergedJs) continue;
     const inlineScript = document.createElement("script");
-    inlineScript.textContent = escapeInlineScriptSource(stripJsCommentsParserSafe(mergedJs));
+    inlineScript.textContent = inlineScriptSource(mergedJs);
     if (anchor) anchor.before(inlineScript);
     else document.body.appendChild(inlineScript);
   }
@@ -799,6 +804,16 @@ function joinJsChunks(chunks: string[]): string {
     .join("\n");
 }
 
+// Compiled, never called: esbuild accepts export, top-level await and import.meta, which a classic script rejects.
+export function parsesAsScript(source: string): boolean {
+  try {
+    new Function(source);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function stripJsCommentsParserSafe(source: string): string {
   if (!source) return source;
   try {
@@ -807,6 +822,10 @@ function stripJsCommentsParserSafe(source: string): string {
   } catch {
     return source;
   }
+}
+
+function inlineScriptSource(js: string): string {
+  return escapeInlineScriptSource(stripJsCommentsParserSafe(js));
 }
 
 export interface BundleOptions {
@@ -928,11 +947,24 @@ function hoistCompositionScripts(
     authoredRootId: string | undefined;
     seenCompScriptSrcs: Set<string>;
     compScriptChunks: DeferredScriptChunk[];
+    importMaps: ImportMap[];
+    moduleScripts: string[];
   },
 ): void {
-  for (const scriptEl of [...container.querySelectorAll("script")]) {
+  for (const scriptEl of executableScripts(container)) {
     const externalSrc = (scriptEl.getAttribute("src") || "").trim();
-    if (externalSrc) {
+    const type = (scriptEl.getAttribute("type") || "").trim().toLowerCase();
+    if (!externalSrc && type === "importmap") {
+      const map = parseImportMap(scriptEl.textContent || "", (url) => url);
+      if (map) opts.importMaps.push(map);
+      else
+        console.warn(
+          `[HyperFrames] ${opts.compId}: import map is not valid JSON, so it is skipped.`,
+        );
+    } else if (!externalSrc && type === "module") {
+      const prelude = opts.compId ? scopedModulePrelude(opts.runtimeCompId || opts.compId) : "";
+      opts.moduleScripts.push(prelude + (scriptEl.textContent || ""));
+    } else if (externalSrc) {
       hoistExternalScript(
         externalSrc,
         opts.projectDir,
@@ -1183,6 +1215,8 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
           authoredRootId: authoredRootId ?? undefined,
           seenCompScriptSrcs,
           compScriptChunks,
+          importMaps: subCompResult.importMaps,
+          moduleScripts: subCompResult.moduleScripts,
         });
 
         // Copy dimension attributes from inner root to host if not already set
@@ -1218,6 +1252,8 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
           authoredRootId: undefined,
           seenCompScriptSrcs,
           compScriptChunks,
+          importMaps: subCompResult.importMaps,
+          moduleScripts: subCompResult.moduleScripts,
         });
 
         host.innerHTML = innerDoc.body.innerHTML || "";
@@ -1261,12 +1297,15 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
     }
   }
   for (const { scene, chunks } of scriptRuns) {
-    const script = document.createElement("script");
-    if (scene) script.setAttribute(SCENE_PART_ATTR, scene);
-    script.textContent = joinJsChunks(
-      chunks.map((chunk) => (typeof chunk === "string" ? chunk : chunk())),
-    );
-    document.body.appendChild(script);
+    const texts = chunks.map((chunk) => (typeof chunk === "string" ? chunk : chunk()));
+    const joined = joinJsChunks(texts);
+    const skipsRunMerge = Boolean(scene);
+    for (const text of parsesAsScript(joined) ? [joined] : texts.filter(Boolean)) {
+      const script = document.createElement("script");
+      if (scene) script.setAttribute(SCENE_PART_ATTR, scene);
+      script.textContent = skipsRunMerge ? inlineScriptSource(text) : text;
+      document.body.appendChild(script);
+    }
   }
   emitMountedModuleScripts(document, subCompResult.importMaps, subCompResult.moduleScripts);
 
