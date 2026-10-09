@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  resizeRemainderShift,
   resolveCenterResizeScale,
   resolveCenterResizeSize,
   resolveRotatedResizeCursor,
@@ -138,4 +139,40 @@ describe("resolveRotatedResizeCursor", () => {
   it("wraps negative rotations", () => {
     expect(resolveRotatedResizeCursor("se", -90)).toBe("nesw-resize");
   });
+});
+
+describe("resizeRemainderShift", () => {
+  const written = { width: 301, height: 150 };
+  const wanted = { width: 300.6, height: 150.3 };
+  const centre = { x: 400, y: 300 };
+  // Local (u, v) px map to overlay px through a 1.5x scale, a rotation and an optional x mirror.
+  const box = (angle: number, mirror: 1 | -1) => {
+    const at = (u: number, v: number) => ({
+      x: centre.x + 1.5 * (mirror * u * Math.cos(angle) - v * Math.sin(angle)),
+      y: centre.y + 1.5 * (mirror * u * Math.sin(angle) + v * Math.cos(angle)),
+    });
+    const [w, h] = [written.width / 2, written.height / 2];
+    return { at, corners: { nw: at(-w, -h), ne: at(w, -h), sw: at(-w, h), se: at(w, h) } };
+  };
+
+  // The chrome draws a mirrored layer unrotated, so its se handle sits on the layer's local sw corner.
+  it.each([
+    ["nw", 30, 1, -1, -1],
+    ["ne", 30, 1, 1, -1],
+    ["sw", 30, 1, -1, 1],
+    ["se", 30, 1, 1, 1],
+    ["se", 0, -1, -1, 1],
+    ["sw", 0, -1, 1, 1],
+    ["ne", 0, -1, -1, -1],
+  ] as const)(
+    "%s handle at %i deg, mirror %i, lands local corner (%i, %i)",
+    (handle, deg, mirror, su, sv) => {
+      const { at, corners } = box((deg * Math.PI) / 180, mirror);
+      const grabbed = at((su * written.width) / 2, (sv * written.height) / 2);
+      const shift = resizeRemainderShift(corners, handle, deg, { wanted, written });
+      const target = at((su * wanted.width) / 2, (sv * wanted.height) / 2);
+      expect(grabbed.x + shift.x).toBeCloseTo(target.x, 9);
+      expect(grabbed.y + shift.y).toBeCloseTo(target.y, 9);
+    },
+  );
 });

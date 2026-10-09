@@ -14,6 +14,7 @@
  * rendered center, feeding the center-pin translate through the manual-offset
  * channel) lives in useDomEditOverlayGestures.ts.
  */
+import type { FixedCorner } from "./domEditOverlayGeometry";
 import type { ResizeHandle } from "./domEditOverlayGestures";
 
 /** Minimum element edge in LOCAL px — mirrors the old MIN_RESIZE_EDGE_PX clamp
@@ -110,6 +111,31 @@ export function resolveRotatedResizeCursor(handle: ResizeHandle, rotationDeg: nu
   const normalized = ((angle % 360) + 360) % 360;
   const bucket = Math.round(normalized / 45) % 8;
   return CURSORS_8[bucket]!;
+}
+
+type Size = { width: number; height: number };
+/** The size the pointer asks for and the whole-px size written for it. */
+export type ResizeDraftSizes = { wanted: Size; written: Size };
+
+/** Overlay shift of the pinned center that puts the grabbed corner where the wanted size would: the
+ *  written size is whole px, so half the remainder moves along the element's own rendered edges. */
+export function resizeRemainderShift(
+  corners: Record<FixedCorner, { x: number; y: number }>,
+  handle: ResizeHandle,
+  rotationDeg: number,
+  { wanted, written }: ResizeDraftSizes,
+): { x: number; y: number } {
+  const angle = ((CORNER_BASE_ANGLE_DEG[handle] + rotationDeg) * Math.PI) / 180;
+  const grab = { x: Math.sin(angle), y: -Math.cos(angle) };
+  const u = { x: corners.ne.x - corners.nw.x, y: corners.ne.y - corners.nw.y };
+  const v = { x: corners.sw.x - corners.nw.x, y: corners.sw.y - corners.nw.y };
+  // The grabbed corner's side of each local edge, from geometry: a mirrored layer swaps the handle's corner.
+  const kw =
+    (Math.sign(grab.x * u.x + grab.y * u.y) * (wanted.width - written.width)) / (2 * written.width);
+  const kh =
+    (Math.sign(grab.x * v.x + grab.y * v.y) * (wanted.height - written.height)) /
+    (2 * written.height);
+  return { x: u.x * kw + v.x * kh, y: u.y * kw + v.y * kh };
 }
 
 /** Per-frame anchored-resize center accumulator: ADD the residual center correction
